@@ -13,6 +13,7 @@ A light live wallpaper app for Windows. Plays videos, GIFs and Wallpaper Engine 
 - **Several screens**, each with its own wallpaper.
 - **Quality modes**: Fast, Sharp and Anime (Anime4K upscaling).
 - **Stays out of the way**: stops while a game is fullscreen or windows cover the desktop.
+- **Updates itself**: when a new version is out, Wisp asks and installs it (from 0.3.1 on).
 
 ## Download
 
