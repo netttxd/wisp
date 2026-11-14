@@ -1,0 +1,21 @@
+Wisp
+Copyright (c) 2026 the author of Wisp. All rights reserved.
+
+This is proprietary software. It is not open source.
+
+You may:
+  - download Wisp from the author or someone the author shared it with,
+  - install it and use it on your own computers, for free.
+
+You may not, without written permission from the author:
+  - copy, sell, rent, rehost or redistribute Wisp, alone or bundled with anything else,
+  - modify it, or make your own program from it or from any part of it,
+  - decompile, disassemble or reverse engineer it, except where the law says you may
+    no matter what a license says,
+  - remove or change this notice or the author's name.
+
+Wisp is provided "as is", without warranty of any kind. The author is not liable for any
+damage or loss that comes from using it, as far as the law allows.
+
+Wisp includes software by others under their own licenses (mpv and Anime4K): see
+LICENSES.txt. This license covers only Wisp's own code and artwork, not theirs.
