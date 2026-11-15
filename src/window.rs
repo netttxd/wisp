@@ -1048,6 +1048,8 @@ struct App {
     bg_key: String,
     /// Where Home's right panel ended last frame, so Recently used can use the full width below it.
     side_bottom: f32,
+    /// The name being typed for a new preset.
+    naming: Option<String>,
 }
 
 impl App {
@@ -1096,6 +1098,7 @@ impl App {
             opts: false,
             bg_key: String::new(),
             side_bottom: 0.0,
+            naming: None,
             cfg,
             seen,
             checked: Instant::now(),
@@ -1854,6 +1857,7 @@ impl App {
                 });
             });
         }
+        self.presets(ui);
         divider(ui);
         let (text, color) = self.overall();
         status_line(ui, &text, color, 12.5);
@@ -1861,6 +1865,94 @@ impl App {
             let pct = |v: Option<f32>| v.map_or("…".to_string(), |v| if v < 10.0 { format!("{v:.1}%") } else { format!("{v:.0}%") });
             ui.label(small(format!("{} MB memory · CPU {} · GPU {}", self.ram, pct(self.cpu), pct(self.gpu))))
                 .on_hover_text("What Wisp's wallpapers use, as Task Manager counts it");
+        }
+    }
+
+    /// Presets: what every screen plays, saved under a name. Click one to put it back; right-click to replace or delete.
+    fn presets(&mut self, ui: &mut egui::Ui) {
+        divider(ui);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("PRESETS").font(bold(11.5)).color(GRAY).extra_letter_spacing(1.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.naming.is_none() && ghost_button(ui, "+ Save").on_hover_text("Save what's on your screens now").clicked() {
+                    self.naming = Some(format!("Preset {}", self.cfg.presets.len() + 1));
+                }
+            });
+        });
+        if let Some(name) = self.naming.as_mut() {
+            let mut done = None;
+            ui.horizontal(|ui| {
+                let field = ui.add(egui::TextEdit::singleline(name).desired_width(ui.available_width() - 120.0).margin(Vec2::new(10.0, 7.0)));
+                if !field.has_focus() && !field.lost_focus() && ui.memory(|m| m.focused().is_none()) {
+                    field.request_focus();
+                }
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if primary_button(ui, "Save").clicked() || enter {
+                    done = Some(true);
+                }
+                if ghost_button(ui, "Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    done = Some(false);
+                }
+            });
+            match done {
+                Some(true) => {
+                    let name = self.naming.take().unwrap_or_default();
+                    let name = if name.trim().is_empty() { format!("Preset {}", self.cfg.presets.len() + 1) } else { name.trim().to_string() };
+                    let p = self.cfg.preset_now(&name);
+                    self.cfg.presets.push(p);
+                    self.commit();
+                    self.show_toast(format!("Saved “{name}”"), false);
+                }
+                Some(false) => self.naming = None,
+                None => {}
+            }
+        }
+        if self.cfg.presets.is_empty() {
+            if self.naming.is_none() {
+                ui.add(egui::Label::new(small("Save your screens to switch back in one click.")).wrap());
+            }
+            return;
+        }
+        let now = self.cfg.preset_now("");
+        let mut apply = None;
+        let mut replace = None;
+        let mut delete = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            for (k, p) in self.cfg.presets.iter().enumerate() {
+                let on = p.span == now.span && p.screens == now.screens;
+                let resp = chip(ui, &p.name, on).on_hover_text(if on { "On your screens now" } else { "Put this on your screens" });
+                if resp.clicked() && !on {
+                    apply = Some(k);
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Replace with what's on now").clicked() {
+                        replace = Some(k);
+                        ui.close();
+                    }
+                    if ui.button(RichText::new("Delete").color(Color32::from_rgb(255, 143, 143))).clicked() {
+                        delete = Some(k);
+                        ui.close();
+                    }
+                });
+            }
+        });
+        if let Some(k) = apply {
+            let p = self.cfg.presets[k].clone();
+            self.cfg.use_preset(&p);
+            self.hero = None;
+            self.trial = None;
+            self.commit();
+            self.show_toast(format!("Using “{}”", p.name), false);
+        } else if let Some(k) = replace {
+            let name = self.cfg.presets[k].name.clone();
+            self.cfg.presets[k] = self.cfg.preset_now(&name);
+            self.commit();
+            self.show_toast(format!("Updated “{name}”"), false);
+        } else if let Some(k) = delete {
+            let p = self.cfg.presets.remove(k);
+            self.commit();
+            self.show_toast(format!("Deleted “{}”", p.name), false);
         }
     }
 
@@ -2644,9 +2736,9 @@ impl App {
         group(ui, "Picture", |ui| {
             let at = QUALITIES.iter().position(|q| *q == self.cfg.quality).unwrap_or(1);
             let desc = [
-                "Fast: uses the least graphics power. Good for laptops.",
-                "Sharp: crisp scaling and smooth gradients. Recommended for most PCs.",
-                "Anime: AI upscaling for drawn art. Uses more graphics power.",
+                "Fast: plays smaller copies of big videos and uses the least graphics power. Good for laptops.",
+                "Sharp: plays the original file with the best scaling and smooth gradients. Recommended for most PCs.",
+                "Anime: like Sharp, plus AI upscaling for drawn art smaller than your screen. Uses more graphics power.",
             ][at];
             row(ui, "Quality", desc, |ui| {
                 if let Some(k) = segmented(ui, &QUALITY_LABELS, at) {
@@ -2662,7 +2754,7 @@ impl App {
                 }
             });
             if limit {
-                row(ui, &format!("Frames per second · {}", self.fps_drag), "30 looks smooth for most wallpapers. Videos made with fewer play as they are.", |ui| {
+                row(ui, &format!("Frames per second · {}", self.fps_drag), "30 looks smooth for most wallpapers. On Sharp and Anime, videos play at their own rate.", |ui| {
                     ui.spacing_mut().slider_width = 220.0;
                     let resp = ui.add(egui::Slider::new(&mut self.fps_drag, 10..=60).show_value(false));
                     // Save when the drag ends, not on every step: each change makes new wallpaper copies.
@@ -2747,7 +2839,7 @@ impl App {
                     let _ = Command::new("explorer").arg(downloads_dir()).spawn();
                 }
             });
-            row(ui, &format!("Temporary files · {}", mb(cache)), "Smaller copies of big videos so they use less memory. Safe to clear; they're made again when needed.", |ui| {
+            row(ui, &format!("Temporary files · {}", mb(cache)), "Smaller copies of big videos, for the Fast quality. Safe to clear; they're made again when needed.", |ui| {
                 if soft_button(ui, "Clear").clicked() {
                     // Files in use by a playing wallpaper stay; the rest are made again when needed.
                     for e in fs::read_dir(cache_dir()).into_iter().flatten().flatten() {

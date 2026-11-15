@@ -113,6 +113,17 @@ struct Config {
     told_tray: bool,
     /// The window already said, once, whether Wallpaper Engine is installed.
     told_we: bool,
+    /// Saved setups: what every screen plays, and how, under a name.
+    presets: Vec<Preset>,
+}
+
+/// A saved setup of all screens, put back with one click.
+#[derive(Clone, PartialEq, Debug)]
+struct Preset {
+    name: String,
+    span: bool,
+    /// Per screen: file, fit, which part shows, zoom.
+    screens: Vec<(String, String, (f32, f32), f32)>,
 }
 
 /// The library: every wallpaper used, newest first. Home shows the first few as "recent".
@@ -171,6 +182,7 @@ impl Config {
             battery_pause: true,
             told_tray: false,
             told_we: false,
+            presets: Vec::new(),
         };
         for line in text.lines() {
             match line.split_once('=') {
@@ -214,6 +226,20 @@ impl Config {
                 Some(("battery_pause", v)) => c.battery_pause = v != "false",
                 Some(("told_tray", v)) => c.told_tray = v == "true",
                 Some(("told_we", v)) => c.told_we = v == "true",
+                // "preset=<name>|<span>|<file>*<fit>*<x>*<y>*<zoom>|…": one screen per part (paths can't hold | or *).
+                Some(("preset", v)) => {
+                    let mut parts = v.split('|');
+                    if let (Some(name), Some(span)) = (parts.next(), parts.next()) {
+                        let screens = parts
+                            .filter_map(|s| {
+                                let p: Vec<&str> = s.split('*').collect();
+                                let n = |k: usize| p.get(k).and_then(|v| v.parse::<f32>().ok());
+                                (p.len() == 5 && FITS.contains(&p[1])).then(|| (p[0].to_string(), p[1].to_string(), (n(2).unwrap_or(0.0).clamp(-1.0, 1.0), n(3).unwrap_or(0.0).clamp(-1.0, 1.0)), n(4).unwrap_or(1.0).clamp(1.0, MAX_ZOOM)))
+                            })
+                            .collect();
+                        c.presets.push(Preset { name: name.into(), span: span == "true", screens });
+                    }
+                }
                 Some(("volume", v)) => c.volume = v.parse::<u32>().unwrap_or(50).min(100),
                 // "setting=<file>|<name>|<json>": paths can't contain "|", and the JSON comes last.
                 Some(("setting", v)) => {
@@ -250,6 +276,26 @@ impl Config {
         self.waits[i].clear();
     }
 
+    /// What every screen plays now, as a preset.
+    fn preset_now(&self, name: &str) -> Preset {
+        let screens = (0..self.files.len()).map(|i| (self.files[i].clone(), self.fits[i].clone(), self.pans[i], self.zooms[i])).collect();
+        Preset { name: name.into(), span: self.span, screens }
+    }
+
+    /// Puts a preset on the screens. Screens it doesn't know (one plugged in since) keep what they play.
+    fn use_preset(&mut self, p: &Preset) {
+        self.span = p.span;
+        for (i, (file, fit, pan, zoom)) in p.screens.iter().enumerate().take(self.files.len()) {
+            if file.is_empty() {
+                self.files[i].clear();
+                self.waits[i].clear();
+            } else {
+                self.set_file(i, file.clone());
+            }
+            (self.fits[i], self.pans[i], self.zooms[i]) = (fit.clone(), *pan, *zoom);
+        }
+    }
+
     /// Writes the config and returns the text written, so the writer can tell its own change from others'.
     fn save(&self) -> String {
         let p = Config::path();
@@ -280,7 +326,12 @@ impl Config {
         out += &format!("fps={}\nquality={}\npaused={}\naudio={}\nvolume={}\nspan={}\n", self.fps, self.quality, self.paused, self.audio, self.volume, self.span);
         out += &format!("game_pause={}\nbattery_pause={}\ntold_tray={}\ntold_we={}\n", self.game_pause, self.battery_pause, self.told_tray, self.told_we);
         // Settings of wallpapers no longer in the library are dropped.
-        for (file, values) in self.settings.iter().filter(|(f, _)| self.recent.contains(f) || self.files.contains(f)) {
+        for p in &self.presets {
+            let screens: Vec<String> = p.screens.iter().map(|(f, fit, (x, y), z)| format!("{f}*{fit}*{x}*{y}*{z}")).collect();
+            out += &format!("preset={}|{}|{}\n", p.name.replace(['|', '\n'], " "), p.span, screens.join("|"));
+        }
+        let in_preset = |f: &String| self.presets.iter().any(|p| p.screens.iter().any(|s| s.0 == *f));
+        for (file, values) in self.settings.iter().filter(|(f, _)| self.recent.contains(f) || self.files.contains(f) || in_preset(f)) {
             for (name, value) in values {
                 out += &format!("setting={file}|{name}|{value}\n");
             }
@@ -746,6 +797,12 @@ impl Slot {
 }
 
 /// Wallpaper Engine scenes are stored as the path of their scene.pkg.
+/// Whether a video is smaller than the screen (it gets enlarged by more than 10% to cover it).
+fn smaller_than(file: &str, monitor: &RECT) -> bool {
+    let (mw, mh) = size(monitor);
+    video_size(file).is_some_and(|(vw, vh)| vw > 0 && vh > 0 && (mw as f32 / vw as f32).max(mh as f32 / vh as f32) > 1.1)
+}
+
 fn is_scene(path: &str) -> bool {
     path.to_lowercase().ends_with("scene.pkg")
 }
@@ -818,9 +875,24 @@ fn spawn(quality: &str, fps: u32, file: &str, original: &str, fit: &str, monitor
         // Cheapest scaling, no debanding: least GPU, softest picture.
         options.push(("profile", "fast"));
     } else {
-        // Sharp scaling and debanding (removes color stripes in gradients).
-        options.extend([("scale", "spline36"), ("cscale", "spline36"), ("dscale", "mitchell"), ("deband", "yes")]);
-        if quality == "anime" {
+        // mpv's best scaling: a sharp EWA Lanczos when enlarging, Catmull-Rom in linear light when shrinking a 4K
+        // original to the screen, and stronger debanding (removes color stripes in dark gradients).
+        options.extend([
+            ("scale", "ewa_lanczossharp"),
+            ("cscale", "ewa_lanczossharp"),
+            ("dscale", "catmull_rom"),
+            ("correct-downscaling", "yes"),
+            ("linear-downscaling", "yes"),
+            ("sigmoid-upscaling", "yes"),
+            ("deband", "yes"),
+            ("deband-iterations", "2"),
+            ("deband-threshold", "35"),
+            ("deband-range", "20"),
+            ("deband-grain", "5"),
+            ("dither-depth", "auto"),
+        ]);
+        // Anime4K enlarges drawn art; on a video already as big as the screen it only costs GPU.
+        if quality == "anime" && smaller_than(original, monitor) {
             options.push(("glsl-shaders", shaders.as_str()));
         }
     }
@@ -1370,6 +1442,12 @@ fn memory_mb() -> u64 {
     c.WorkingSetSize as u64 / 1_048_576
 }
 
+/// Lighter copies (smaller, re-encoded) are only for the Fast quality: they save GPU work but lose detail, so Sharp and
+/// Anime play the original file and let the GPU scale it.
+fn lighter(cfg: &Config) -> bool {
+    cfg.quality == "fast"
+}
+
 /// The cached lighter copy of each monitor's wallpaper.
 fn copies(cfg: &Config, slots: &[Slot]) -> Vec<PathBuf> {
     slots.iter().enumerate().map(|(i, s)| cache_path(&cfg.files[i], target(cfg, &s.rect))).collect()
@@ -1584,7 +1662,7 @@ fn main() {
                         // Video to video: the playing player opens the new file, so it's there at once.
                         let file = &new.files[i];
                         let copy = cache_path(file, target(&new, &s.rect));
-                        let play = if copy.exists() { copy.display().to_string() } else { file.clone() };
+                        let play = if lighter(&new) && copy.exists() { copy.display().to_string() } else { file.clone() };
                         let swapped = file_changed
                             && !settings_changed
                             && !everything
@@ -1669,12 +1747,12 @@ fn main() {
                 let copy = cache_path(file, t);
                 // Each file and target is tried once; a new quality or frame rate cap makes a new copy.
                 let key = format!("{file}|{t:?}");
-                if !file.is_empty() && !is_scene(file) && s.tried != key && s.shrinking.is_none() && !copy.exists() {
+                if lighter(&cfg) && !file.is_empty() && !is_scene(file) && s.tried != key && s.shrinking.is_none() && !copy.exists() {
                     s.tried = key;
                     let (f, out) = (file.clone(), copy.clone());
                     s.shrinking = Some(std::thread::spawn(move || shrink(f, t, out)));
                 }
-                if s.shrinking.as_ref().is_some_and(|t| t.is_finished()) && s.shrinking.take().unwrap().join().unwrap_or(false) {
+                if s.shrinking.as_ref().is_some_and(|t| t.is_finished()) && s.shrinking.take().unwrap().join().unwrap_or(false) && lighter(&cfg) {
                     // The copy is ready: the player switches to it in place (or starts over on it).
                     // The copy must be this file's: after a quick switch, the finished one can be for the last file.
                     let c = copy.display().to_string();
@@ -1713,7 +1791,7 @@ fn main() {
                 } else if s.player.is_none() {
                     // The frame rate cap lives in the copy. A playback cap costs RAM and saves no decoding,
                     // so the original plays uncapped for the few seconds until its copy is ready.
-                    let play = if copy.exists() {
+                    let play = if lighter(&cfg) && copy.exists() {
                         // Mark the copy as recently used, so the cache trim keeps it.
                         let _ = fs::File::options().write(true).open(&copy).and_then(|f| f.set_modified(SystemTime::now()));
                         copy.display().to_string()
@@ -1819,6 +1897,46 @@ mod tests {
         assert_eq!(areas(&mons[..1], true).len(), 1);
         // The setting is saved.
         assert!(Config::parse(&format!("{}span=true\n", Config::parse("").save_text())).span);
+    }
+
+    #[test]
+    fn mpv_takes_quality_options() {
+        // An option this libmpv doesn't know makes every Sharp and Anime wallpaper fail to start.
+        let opts = [
+            ("vo", "null"),
+            ("scale", "ewa_lanczossharp"),
+            ("cscale", "ewa_lanczossharp"),
+            ("dscale", "catmull_rom"),
+            ("correct-downscaling", "yes"),
+            ("linear-downscaling", "yes"),
+            ("sigmoid-upscaling", "yes"),
+            ("deband", "yes"),
+            ("deband-iterations", "2"),
+            ("deband-threshold", "35"),
+            ("deband-range", "20"),
+            ("deband-grain", "5"),
+            ("dither-depth", "auto"),
+        ];
+        assert!(mpv::Mpv::new(&opts).is_some());
+    }
+
+    #[test]
+    fn saves_presets() {
+        let mut c = Config::parse("file0=C:\\a.mp4\nfile1=\nfit0=fit\nplace0=0.5,-1,1.5\nspan=false\n");
+        c.fit_to(2);
+        c.presets.push(c.preset_now("Night | city"));
+        let back = Config::parse(&c.save_text());
+        assert_eq!(back.presets.len(), 1);
+        let p = &back.presets[0];
+        assert_eq!(p.name, "Night   city");
+        assert_eq!(p.screens, vec![("C:\\a.mp4".to_string(), "fit".to_string(), (0.5, -1.0), 1.5), (String::new(), "fill".to_string(), (0.0, 0.0), 1.0)]);
+        // Putting it back restores both screens and puts the file at the top of the library.
+        let mut d = Config::parse("file0=C:\\b.mp4\nfile1=C:\\c.mp4\n");
+        d.fit_to(2);
+        d.use_preset(p);
+        assert_eq!(d.files, ["C:\\a.mp4", ""]);
+        assert_eq!((d.fits[0].as_str(), d.zooms[0]), ("fit", 1.5));
+        assert_eq!(d.recent[0], "C:\\a.mp4");
     }
 
     #[test]
