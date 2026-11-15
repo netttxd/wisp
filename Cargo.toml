@@ -1,0 +1,40 @@
+[package]
+name = "wisp"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+tray-icon = "0.21"
+# The app window. Only runs in the separate --window process.
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+# Scenes are drawn with OpenGL, then shown through a Direct3D 11 swap chain: the desktop only shows DirectX output.
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+# Scene text: fonts drawn with ab_glyph (the window already uses it), clock/date scripts run in QuickJS.
+ab_glyph = "0.2"
+rquickjs = { version = "0.9", features = ["parallel"] }
+# Wallpaper Engine scenes: scene.json is JSON, and .tex pixels are LZ4-compressed.
+serde_json = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# unwind, not abort: a panic in one screen's scene thread ends that scene, not all of Wisp.
+panic = "unwind"
+strip = true
