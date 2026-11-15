@@ -49,6 +49,19 @@ const ANIME4K: [(&str, &str); 6] = [
     ("Anime4K_Upscale_CNN_x2_S.glsl", include_str!("../assets/anime4k/Anime4K_Upscale_CNN_x2_S.glsl")),
 ];
 
+/// The condition the upscale shaders already carry: the picture is enlarged by more than 1.2x. mpv checks it every frame.
+const UPSCALING: &str = "//!WHEN OUTPUT.w MAIN.w / 1.200 > OUTPUT.h MAIN.h / 1.200 > *\n";
+
+/// A shader's text as Wisp uses it. Clamp and Restore have no condition of their own and would run on every 4K frame
+/// that is only being shrunk, so each of their passes gets the upscale shaders' condition.
+fn anime4k_text(name: &str, text: &str) -> String {
+    if name.contains("Clamp_Highlights") || name.contains("Restore") {
+        text.replace("//!HOOK", &format!("{UPSCALING}//!HOOK"))
+    } else {
+        text.to_string()
+    }
+}
+
 /// Writes the Anime4K shaders next to the cache (mpv reads them from files) and returns mpv's list of them.
 fn anime4k_shaders() -> String {
     let dir = cache_dir().with_file_name("shaders");
@@ -57,8 +70,9 @@ fn anime4k_shaders() -> String {
         .iter()
         .map(|(name, text)| {
             let p = dir.join(name);
+            let text = anime4k_text(name, text);
             if fs::metadata(&p).map(|m| m.len()).ok() != Some(text.len() as u64) {
-                let _ = fs::write(&p, text);
+                let _ = fs::write(&p, &text);
             }
             p.display().to_string()
         })
@@ -286,6 +300,10 @@ impl Config {
     fn use_preset(&mut self, p: &Preset) {
         self.span = p.span;
         for (i, (file, fit, pan, zoom)) in p.screens.iter().enumerate().take(self.files.len()) {
+            // A wallpaper deleted since the preset was saved: the screen keeps what it plays.
+            if !file.is_empty() && !Path::new(file).exists() {
+                continue;
+            }
             if file.is_empty() {
                 self.files[i].clear();
                 self.waits[i].clear();
@@ -797,12 +815,6 @@ impl Slot {
 }
 
 /// Wallpaper Engine scenes are stored as the path of their scene.pkg.
-/// Whether a video is smaller than the screen (it gets enlarged by more than 10% to cover it).
-fn smaller_than(file: &str, monitor: &RECT) -> bool {
-    let (mw, mh) = size(monitor);
-    video_size(file).is_some_and(|(vw, vh)| vw > 0 && vh > 0 && (mw as f32 / vw as f32).max(mh as f32 / vh as f32) > 1.1)
-}
-
 fn is_scene(path: &str) -> bool {
     path.to_lowercase().ends_with("scene.pkg")
 }
@@ -891,8 +903,8 @@ fn spawn(quality: &str, fps: u32, file: &str, original: &str, fit: &str, monitor
             ("deband-grain", "5"),
             ("dither-depth", "auto"),
         ]);
-        // Anime4K enlarges drawn art; on a video already as big as the screen it only costs GPU.
-        if quality == "anime" && smaller_than(original, monitor) {
+        // Anime4K enlarges drawn art. Every pass only runs while the picture is enlarged (see anime4k_text).
+        if quality == "anime" {
             options.push(("glsl-shaders", shaders.as_str()));
         }
     }
@@ -1655,7 +1667,9 @@ fn main() {
                 for (i, s) in slots.iter_mut().enumerate() {
                     let file_changed = new.files[i] != cfg.files[i];
                     let settings_changed = new.settings.get(&new.files[i]) != cfg.settings.get(&cfg.files[i]);
-                    let everything = new.fps != cfg.fps || new.quality != cfg.quality || new.paused != cfg.paused;
+                    // The frame rate limit only reaches scenes and Fast's lighter copies; videos on Sharp and Anime play at their own rate.
+                    let fps_matters = lighter(&new) || is_scene(&new.files[i]);
+                    let everything = (new.fps != cfg.fps && fps_matters) || new.quality != cfg.quality || new.paused != cfg.paused;
                     let placed = new.fits[i] != cfg.fits[i] || new.pans[i] != cfg.pans[i] || new.zooms[i] != cfg.zooms[i];
                     if file_changed || settings_changed || everything {
                         s.fails = 0;
@@ -1930,13 +1944,31 @@ mod tests {
         let p = &back.presets[0];
         assert_eq!(p.name, "Night   city");
         assert_eq!(p.screens, vec![("C:\\a.mp4".to_string(), "fit".to_string(), (0.5, -1.0), 1.5), (String::new(), "fill".to_string(), (0.0, 0.0), 1.0)]);
-        // Putting it back restores both screens and puts the file at the top of the library.
+        // A file deleted since: that screen keeps what it plays (the other screen still follows the preset).
         let mut d = Config::parse("file0=C:\\b.mp4\nfile1=C:\\c.mp4\n");
         d.fit_to(2);
         d.use_preset(p);
-        assert_eq!(d.files, ["C:\\a.mp4", ""]);
+        assert_eq!(d.files, ["C:\\b.mp4", ""]);
+        // A file that exists: putting it back restores it and puts it at the top of the library.
+        let real = env::temp_dir().join("wisp-preset-test.mp4");
+        fs::write(&real, b"x").unwrap();
+        let real = real.display().to_string();
+        let mut p = p.clone();
+        p.screens[0].0 = real.clone();
+        d.use_preset(&p);
+        assert_eq!(d.files[0], real);
         assert_eq!((d.fits[0].as_str(), d.zooms[0]), ("fit", 1.5));
-        assert_eq!(d.recent[0], "C:\\a.mp4");
+        assert_eq!(d.recent[0], real);
+        let _ = fs::remove_file(&real);
+    }
+
+    #[test]
+    fn anime4k_only_while_enlarging() {
+        // Every pass of every shader carries a condition, so none runs on a 4K video that is only shrunk.
+        for (name, text) in ANIME4K {
+            let t = anime4k_text(name, text);
+            assert_eq!(t.matches("//!HOOK").count(), t.matches("//!WHEN").count(), "{name}");
+        }
     }
 
     #[test]
