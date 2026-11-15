@@ -28,6 +28,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{Dwm::*, Gdi::*},
     System::{
+        Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ},
         Threading::{CreateMutexW, GetCurrentProcess, SetPriorityClass, SetProcessWorkingSetSize, BELOW_NORMAL_PRIORITY_CLASS},
     },
     UI::{Controls::Dialogs::*, WindowsAndMessaging::*},
@@ -67,7 +68,7 @@ fn anime4k_shaders() -> String {
 const FITS: [&str; 3] = ["fill", "fit", "stretch"];
 const FIT_LABELS: [&str; 3] = ["Fill", "Fit", "Stretch"];
 const VIDEO_EXT: [&str; 7] = ["mp4", "webm", "gif", "mkv", "mov", "avi", "webp"];
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CACHE_LIMIT: u64 = 500 * 1024 * 1024;
 const WALLPAPER_ENGINE: &str = "431960";
@@ -908,14 +909,8 @@ fn workshop_id(text: &str) -> Option<String> {
 
 /// Every Steam library folder on this PC.
 fn steam_libraries() -> Vec<PathBuf> {
-    let out = Command::new("reg")
-        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
     // The registry spells it "c:/program files (x86)/steam"; libraryfolders.vdf lists the same folder with backslashes.
-    let Some(steam) = out.lines().find_map(|l| l.split_once("REG_SZ")).map(|(_, v)| PathBuf::from(v.trim().replace('/', r"\"))) else {
+    let Some(steam) = reg_get(r"Software\Valve\Steam", "SteamPath").map(|v| PathBuf::from(v.trim().replace('/', r"\"))) else {
         return Vec::new();
     };
     let vdf = fs::read_to_string(steam.join(r"steamapps\libraryfolders.vdf")).unwrap_or_default();
@@ -1220,16 +1215,35 @@ fn from_workshop(link: &str) -> Workshop {
     Workshop::Waiting(id)
 }
 
-fn reg(args: &[&str]) -> bool {
-    Command::new("reg").args(args).creation_flags(CREATE_NO_WINDOW).status().is_ok_and(|s| s.success())
+// The registry through the Windows API, under HKEY_CURRENT_USER. Never by starting reg.exe: a hidden reg.exe
+// editing the Run key is what malware does, and Windows Defender deleted Wisp for it.
+fn reg_get(key: &str, name: &str) -> Option<String> {
+    let mut buf = vec![0u16; 2048];
+    let mut bytes = (buf.len() * 2) as u32;
+    let ok = unsafe { RegGetValueW(HKEY_CURRENT_USER, w(key).as_ptr(), w(name).as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr().cast(), &mut bytes) } == 0;
+    // `bytes` counts the ending 0.
+    ok.then(|| String::from_utf16_lossy(&buf[..(bytes as usize / 2).saturating_sub(1)]))
+}
+
+fn reg_set(key: &str, name: &str, value: &str) {
+    let v = w(value);
+    unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, w(key).as_ptr(), w(name).as_ptr(), REG_SZ, v.as_ptr().cast(), (v.len() * 2) as u32) };
+}
+
+fn reg_delete(key: &str, name: &str) {
+    unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, w(key).as_ptr(), w(name).as_ptr()) };
+}
+
+/// What "Start with Windows" puts in the Run key: this wisp.exe, quoted.
+fn autostart_command() -> String {
+    format!("\"{}\"", env::current_exe().unwrap_or_default().display())
 }
 
 fn set_autostart(on: bool) {
-    let exe = env::current_exe().unwrap_or_default();
     if on {
-        reg(&["add", RUN_KEY, "/v", APP, "/d", &format!("\"{}\"", exe.display()), "/f"]);
+        reg_set(RUN_KEY, APP, &autostart_command());
     } else {
-        reg(&["delete", RUN_KEY, "/v", APP, "/f"]);
+        reg_delete(RUN_KEY, APP);
     }
 }
 
@@ -1446,11 +1460,17 @@ fn main() {
     // The app was called livewall, then Lumen: move the autostart entry and screen-sized copies over.
     let mut was_autostart = false;
     for old in ["livewall", "Lumen"] {
-        was_autostart |= reg(&["delete", RUN_KEY, "/v", old, "/f"]);
+        if reg_get(RUN_KEY, old).is_some() {
+            reg_delete(RUN_KEY, old);
+            was_autostart = true;
+        }
     }
-    // Also refresh our own entry, so moving wisp.exe to another folder doesn't break "Start with Windows".
-    if was_autostart || reg(&["query", RUN_KEY, "/v", APP]) {
-        set_autostart(true);
+    // Also fix our own entry when wisp.exe moved, so "Start with Windows" keeps working. Written only when it
+    // changed, not on every start.
+    match reg_get(RUN_KEY, APP) {
+        Some(cmd) if cmd != autostart_command() => set_autostart(true),
+        None if was_autostart => set_autostart(true),
+        _ => {}
     }
     let old_cache = PathBuf::from(env::var("LOCALAPPDATA").unwrap_or_default()).join(r"Lumen\cache");
     if !cache_dir().exists() && old_cache.exists() {

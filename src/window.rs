@@ -14,7 +14,13 @@ use std::{
 // A deep, slightly cool dark theme.
 const BG_TOP: Color32 = Color32::from_rgb(19, 25, 37);
 const BG_BOTTOM: Color32 = Color32::from_rgb(11, 14, 20);
-const SIDEBAR: Color32 = Color32::from_rgb(10, 13, 19);
+// Glass over the wallpaper (premultiplied): a dark see-through fill, a faint light edge, and white washes for
+// cards, hover and the picked tab.
+const GLASS: Color32 = Color32::from_rgba_premultiplied(11, 14, 19, 165);
+const GLASS_LINE: Color32 = Color32::from_rgba_premultiplied(30, 30, 30, 30);
+const WASH: Color32 = Color32::from_rgba_premultiplied(12, 12, 12, 12);
+const WASH_HOVER: Color32 = Color32::from_rgba_premultiplied(24, 24, 24, 24);
+const WASH_ON: Color32 = Color32::from_rgba_premultiplied(44, 44, 44, 44);
 const PANEL: Color32 = Color32::from_rgb(24, 29, 39);
 const RAISED: Color32 = Color32::from_rgb(33, 39, 51);
 const SELECTED: Color32 = Color32::from_rgb(56, 64, 80);
@@ -44,9 +50,7 @@ enum Page {
 #[derive(Clone, Copy)]
 enum Icon {
     Search,
-    Library,
     Gear,
-    Screen,
     Link,
     Folder,
 }
@@ -61,23 +65,19 @@ fn draw_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
             painter.circle_stroke(at(0.43, 0.43), r * 0.27, s);
             painter.line_segment([at(0.63, 0.63), at(0.86, 0.86)], s);
         }
-        Icon::Library => {
-            for (x, y) in [(0.14, 0.14), (0.54, 0.14), (0.14, 0.54), (0.54, 0.54)] {
-                painter.rect_stroke(Rect::from_min_size(at(x, y), Vec2::splat(r * 0.32)), CornerRadius::same(2), s, egui::StrokeKind::Middle);
-            }
-        }
         Icon::Gear => {
-            painter.circle_stroke(at(0.5, 0.5), r * 0.17, s);
+            // A cog: 8 square teeth around a ring, and the hole in the middle (not rays, which read as a sun).
+            painter.circle_stroke(at(0.5, 0.5), r * 0.13, s);
+            let mut pts = Vec::new();
             for k in 0..8 {
                 let a = k as f32 * std::f32::consts::TAU / 8.0;
-                let (dx, dy) = (a.cos(), a.sin());
-                painter.line_segment([at(0.5 + dx * 0.27, 0.5 + dy * 0.27), at(0.5 + dx * 0.42, 0.5 + dy * 0.42)], Stroke::new(2.4_f32, color));
+                for (da, rad) in [(-0.3, 0.3), (-0.17, 0.44), (0.17, 0.44), (0.3, 0.3)] {
+                    let b = a + da;
+                    pts.push(at(0.5 + b.cos() * rad, 0.5 + b.sin() * rad));
+                }
             }
-        }
-        Icon::Screen => {
-            painter.rect_stroke(Rect::from_min_max(at(0.1, 0.18), at(0.9, 0.7)), CornerRadius::same(2), s, egui::StrokeKind::Middle);
-            painter.line_segment([at(0.5, 0.7), at(0.5, 0.84)], s);
-            painter.line_segment([at(0.32, 0.86), at(0.68, 0.86)], s);
+            pts.push(pts[0]);
+            painter.add(egui::Shape::line(pts, s));
         }
         Icon::Link => {
             painter.circle_stroke(at(0.5, 0.5), r * 0.38, s);
@@ -486,6 +486,29 @@ fn motionbgs_hits(html: &str) -> Vec<Hit> {
         .collect()
 }
 
+/// A search result picture's bigger version, for the detail view: the sites list small ones, sized in the link.
+fn big_picture(thumb: &str) -> String {
+    // Steam: "…/?ima=fit&imw=322&imh=322…" is resized on request.
+    if thumb.contains("steamusercontent.com") {
+        return format!("{}?ima=fit&imw=1280&imh=1280&letterbox=false", thumb.split('?').next().unwrap_or(thumb));
+    }
+    // MotionBGs: "/i/c/364x205/media/…" is a size picked from the link.
+    if let Some((before, after)) = thumb.split_once("/i/c/") {
+        if let Some((_, rest)) = after.split_once('/') {
+            return format!("{before}/i/c/1280x720/{rest}");
+        }
+    }
+    // MoeWalls (WordPress): "name-thumb-364x205.jpg" is a shrunk copy of "name-thumb.jpg".
+    if let Some((stem, ext)) = thumb.rsplit_once('.') {
+        if let Some((name, size)) = stem.rsplit_once('-') {
+            if size.split_once('x').is_some_and(|(w, h)| !w.is_empty() && !h.is_empty() && (w.to_string() + h).chars().all(|c| c.is_ascii_digit())) {
+                return format!("{name}.{ext}");
+            }
+        }
+    }
+    thumb.to_string()
+}
+
 /// Searches one source (an index into SEARCH) with its filters; an empty query lists its popular or newest.
 fn search(source: usize, query: &str, picks: &[usize], no_anime: bool, page: u32) -> Result<Vec<Hit>, String> {
     let url = search_url(source, query, picks, no_anime, page);
@@ -566,34 +589,59 @@ fn gif_frame(bytes: &[u8]) -> Option<image::RgbaImage> {
 
 /// A small still of a video, cached on disk next to the screen-sized copies. Web links (search results'
 /// pictures) are downloaded and shrunk.
-fn make_thumb(path: &str) -> Option<ColorImage> {
+/// A thumbnail job: a wallpaper's small still, "big:<path>" for the Home picture, or "blur:<path>" for the soft
+/// background behind the other pages.
+fn make_thumb(job: &str) -> Option<ColorImage> {
+    let img = if let Some(path) = job.strip_prefix("big:") {
+        still(path, 1600)?
+    } else if let Some(path) = job.strip_prefix("blur:") {
+        // Blurred small, then stretched over the window: soft and cheap.
+        image::imageops::blur(&image::DynamicImage::ImageRgba8(still(path, 480)?).thumbnail(192, 192).to_rgba8(), 6.0)
+    } else {
+        still(job, 480)?
+    };
+    Some(ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
+}
+
+/// A still of a wallpaper about `px` wide, cached on disk next to the screen-sized copies. Web links (search
+/// results' pictures) are downloaded and shrunk.
+fn still(path: &str, px: u32) -> Option<image::RgbaImage> {
     if path.starts_with("https://") {
         let out = Command::new("curl").args(["-L", "-s", "--max-time", "20", "-A", "Mozilla/5.0"]).arg(path).creation_flags(CREATE_NO_WINDOW).output().ok()?;
         let img = gif_frame(&out.stdout).map(image::DynamicImage::ImageRgba8).or_else(|| image::load_from_memory(&out.stdout).ok())?;
-        let img = img.thumbnail(480, 480).to_rgba8();
-        return Some(ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()));
-    }
-    // Wallpaper Engine items come with a preview picture: quicker than asking mpv, and mpv can't read scene.pkg.
-    // Shrunk, so a Library full of them stays light.
-    if let Some(img) = ["preview.jpg", "preview.png", "preview.gif"].iter().find_map(|n| image::open(Path::new(path).with_file_name(n)).ok()) {
-        let img = img.thumbnail(480, 480).to_rgba8();
-        return Some(ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()));
-    }
-    if is_scene(path) {
-        return None;
+        return Some(img.thumbnail(px, px).to_rgba8());
     }
     let meta = fs::metadata(path).ok()?;
     let mut hasher = DefaultHasher::new();
     (path, meta.len(), meta.modified().ok()).hash(&mut hasher);
     let dir = cache_dir().join("thumbs");
-    let out = dir.join(format!("{:016x}.png", hasher.finish()));
+    let out = dir.join(format!("{:016x}{}.png", hasher.finish(), if px == 480 { String::new() } else { format!("-{px}") }));
+    // A big still of a scene: rendered by Wisp's own scene player, in its own process (about two seconds).
+    if is_scene(path) && px > 480 {
+        if !out.exists() {
+            let _ = fs::create_dir_all(&dir);
+            let folder = Path::new(path).parent()?;
+            let _ = Command::new(env::current_exe().ok()?).arg("--scene-shot").arg(folder).arg(&out).creation_flags(CREATE_NO_WINDOW).status();
+        }
+        if let Ok(img) = image::open(&out) {
+            return Some(img.to_rgba8());
+        }
+    }
+    // Wallpaper Engine items come with a preview picture: quicker than asking mpv, and mpv can't read scene.pkg.
+    // Shrunk, so a Library full of them stays light. (Too small for the big Home picture of a video, which mpv makes.)
+    let preview = || ["preview.jpg", "preview.png", "preview.gif"].iter().find_map(|n| image::open(Path::new(path).with_file_name(n)).ok());
+    if let Some(img) = (px <= 480 || is_scene(path)).then(preview).flatten() {
+        return Some(img.thumbnail(px, px).to_rgba8());
+    }
+    if is_scene(path) {
+        return None;
+    }
     if !out.exists() {
         let _ = fs::create_dir_all(&dir);
         let o = out.display().to_string();
-        mpv::run(&[("audio", "no"), ("start", "25%"), ("frames", "1"), ("vf", "scale=480:-2"), ("ovc", "png"), ("o", &o)], path);
+        mpv::run(&[("audio", "no"), ("start", "25%"), ("frames", "1"), ("vf", &format!("scale={px}:-2")), ("ovc", "png"), ("o", &o)], path);
     }
-    let img = image::open(&out).ok()?.to_rgba8();
-    Some(ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
+    Some(image::open(&out).ok()?.to_rgba8())
 }
 
 /// What adding a link came to.
@@ -656,7 +704,7 @@ fn segmented(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<usiz
 /// A settings group: a rounded panel of rows, each with a title, a gray description and a control on the right.
 fn group(ui: &mut egui::Ui, title: &str, rows: impl FnOnce(&mut egui::Ui)) {
     ui.label(RichText::new(title).font(bold(15.0)));
-    egui::Frame::new().fill(PANEL).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+    egui::Frame::new().fill(WASH).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 14.0;
         rows(ui);
@@ -815,23 +863,59 @@ fn paint_pause(p: &egui::Painter, c: Pos2, paused: bool, color: Color32) {
     }
 }
 
-/// A button `width` wide with a drawn icon and a label, centered together.
-/// `ink`: how far the drawn icon reaches left and right of the point it's drawn at, so the gap to the label is the
-/// same for every icon.
-fn icon_button(ui: &mut egui::Ui, width: f32, label: &str, ink: (f32, f32), icon: impl FnOnce(&egui::Painter, Pos2, Color32)) -> egui::Response {
-    const GAP: f32 = 8.0;
-    let galley = ui.painter().layout_no_wrap(label.into(), egui::FontId::proportional(13.0), SOFT);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
+fn glass_shadow() -> egui::Shadow {
+    egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(60) }
+}
+
+/// A glass pill or panel painted at `r`. (egui can't blur what's behind it, so the fill is dark and see-through.)
+fn glass(p: &egui::Painter, r: Rect, radius: u8) {
+    p.add(glass_shadow().as_shape(r, CornerRadius::same(radius)));
+    p.rect(r, CornerRadius::same(radius), GLASS, Stroke::new(1.0_f32, GLASS_LINE), egui::StrokeKind::Inside);
+}
+
+/// A glass panel that holds widgets.
+fn glass_frame() -> egui::Frame {
+    egui::Frame::new().fill(GLASS).stroke(Stroke::new(1.0_f32, GLASS_LINE)).corner_radius(CornerRadius::same(18)).shadow(glass_shadow()).inner_margin(16.0)
+}
+
+/// A see-through button for over the wallpaper, next to a primary_button.
+fn glass_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let b = egui::Button::new(RichText::new(text).size(13.5)).fill(WASH_HOVER).stroke(Stroke::new(1.0_f32, GLASS_LINE)).corner_radius(CornerRadius::same(9)).min_size(Vec2::new(0.0, 34.0));
+    ui.add(b).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A round button with a drawn icon, for the glass pills.
+fn round_button(ui: &mut egui::Ui, rect: Rect, id: &str, on: bool, icon: impl FnOnce(&egui::Painter, Pos2, Color32)) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(id), Sense::click());
     let lit = resp.hovered() || resp.has_focus();
-    ui.painter().rect_filled(rect, CornerRadius::same(9), if lit { Color32::from_rgb(33, 40, 53) } else { Color32::from_rgb(24, 29, 39) });
-    let color = if lit { TEXT } else { SOFT };
-    // Icon and label centered together across; icon and capitals both centered on the button's middle line.
-    let start = (rect.center().x - (ink.0 + ink.1 + GAP + galley.size().x) / 2.0).round();
-    let mid = rect.center().y.round();
-    icon(ui.painter(), pos2(start + ink.0, mid), color);
-    let top = mid - cap_middle(&galley, 13.0);
-    ui.painter().galley(pos2(start + ink.0 + ink.1 + GAP, top), galley, color);
+    if on || lit {
+        ui.painter().circle_filled(rect.center(), rect.height() / 2.0, if on { WASH_ON } else { WASH_HOVER });
+    }
+    icon(ui.painter(), rect.center(), if on || lit { TEXT } else { SOFT });
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A rectangle shaded from color `a` to `b`: left to right when `across`, else top to bottom.
+fn gradient(p: &egui::Painter, r: Rect, a: Color32, b: Color32, across: bool) {
+    let mut mesh = egui::Mesh::default();
+    let corners = if across { [a, b, b, a] } else { [a, a, b, b] };
+    for (pos, c) in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].into_iter().zip(corners) {
+        mesh.colored_vertex(pos, c);
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(mesh);
+}
+
+/// The part of a picture shaped `img` (width / height) that covers a box shaped `area`, cutting off what doesn't fit.
+fn cover_uv(img: f32, area: f32) -> Rect {
+    if img > area {
+        let keep = area / img;
+        Rect::from_min_max(pos2((1.0 - keep) / 2.0, 0.0), pos2((1.0 + keep) / 2.0, 1.0))
+    } else {
+        let keep = img / area;
+        Rect::from_min_max(pos2(0.0, (1.0 - keep) / 2.0), pos2(1.0, (1.0 + keep) / 2.0))
+    }
 }
 
 /// Three dots, the "more actions" button on Library tiles.
@@ -956,6 +1040,14 @@ struct App {
     got_aspect: Receiver<(String, f32)>,
     /// The fit mode under the pointer last frame, previewed before it's chosen.
     hover_fit: Option<usize>,
+    /// The wallpaper shown big on Home when it isn't the chosen screen's own (a recent one, previewed).
+    hero: Option<String>,
+    /// Home's right side shows the chosen screen's options instead of the screens.
+    opts: bool,
+    /// The big background picture loaded now; others are let go of to keep memory low.
+    bg_key: String,
+    /// Where Home's right panel ended last frame, so Recently used can use the full width below it.
+    side_bottom: f32,
 }
 
 impl App {
@@ -971,7 +1063,7 @@ impl App {
         std::thread::spawn(move || {
             for path in jobs {
                 // Search results' pictures download side by side (only on-screen tiles ask, so a dozen or so at once).
-                if path.starts_with("https://") {
+                if path.starts_with("https://") || path.starts_with("big:https://") {
                     let (done, repaint) = (done.clone(), repaint.clone());
                     std::thread::spawn(move || {
                         let img = make_thumb(&path);
@@ -1000,6 +1092,10 @@ impl App {
             aspect_done,
             got_aspect,
             hover_fit: None,
+            hero: None,
+            opts: false,
+            bg_key: String::new(),
+            side_bottom: 0.0,
             cfg,
             seen,
             checked: Instant::now(),
@@ -1010,7 +1106,7 @@ impl App {
             adding: None,
             failed_link: None,
             fps_drag,
-            autostart: reg(&["query", RUN_KEY, "/v", APP]),
+            autostart: reg_get(RUN_KEY, APP).is_some(),
             storage: None,
             logo,
             thumbs: HashMap::new(),
@@ -1166,13 +1262,13 @@ impl App {
             "covered" => ("Paused · window covers it", "Paused while a window covers this screen. It starts again by itself.", AMBER),
             "game" => ("Paused · game open", "Paused while a game or full-screen app is open. It starts again by itself.", AMBER),
             "battery" => ("Paused · on battery", "Paused on battery. It starts again when you plug in.", AMBER),
-            "paused" => ("Paused by you", "Paused by you. Click Resume all at the bottom to play.", AMBER),
+            "paused" => ("Paused by you", "Paused by you. Press play at the top right.", AMBER),
             "broken" => ("Can't play", "Wisp couldn't play this wallpaper.", RED),
             _ => ("Starting…", "Starting…", MUTED),
         }
     }
 
-    /// One line about everything, for the bottom bar.
+    /// One line about everything, for Home's screens panel.
     fn overall(&self) -> (String, Color32) {
         if !self.running {
             return ("Wallpapers aren't running.".into(), MUTED);
@@ -1236,14 +1332,7 @@ impl App {
         match tex {
             Some(tex) => {
                 let [tw, th] = tex.size().map(|v| v as f32);
-                let (img_aspect, box_aspect) = (tw / th, rect.aspect_ratio());
-                let uv = if img_aspect > box_aspect {
-                    let keep = box_aspect / img_aspect;
-                    Rect::from_min_max(pos2((1.0 - keep) / 2.0, 0.0), pos2((1.0 + keep) / 2.0, 1.0))
-                } else {
-                    let keep = img_aspect / box_aspect;
-                    Rect::from_min_max(pos2(0.0, (1.0 - keep) / 2.0), pos2(1.0, (1.0 + keep) / 2.0))
-                };                egui::Image::new(&tex).uv(uv).corner_radius(radius).paint_at(ui, rect);
+                egui::Image::new(&tex).uv(cover_uv(tw / th, rect.aspect_ratio())).corner_radius(radius).paint_at(ui, rect);
             }
             None => {
                 ui.painter().rect_filled(rect, radius, RAISED);
@@ -1409,28 +1498,149 @@ impl App {
         });
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(18.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            if let Some(logo) = &self.logo {
-                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(28.0)));
-            }
-            ui.label(RichText::new(APP).font(bold(18.0)));
-        });
-        ui.add_space(16.0);
-        let count = self.library_items().len();
-        for (page, icon, name, badge) in [
-            (Page::Home, Icon::Screen, "My desktop", 0),
-            (Page::Discover, Icon::Search, "Discover", 0),
-            (Page::Library, Icon::Library, "Library", count),
-            (Page::Settings, Icon::Gear, "Settings", 0),
-        ] {
-            self.nav(ui, page, icon, name, badge);
+    /// Three glass pills over the top: the name, the pages, and pause · sound · settings for everything.
+    fn top_bar(&mut self, ui: &mut egui::Ui, r: Rect) {
+        let p = ui.painter().clone();
+        let mid = r.top() + 38.0;
+        let label = |text: &str, font: egui::FontId| p.layout_no_wrap(text.into(), font, TEXT);
+        // The name.
+        let name = label(APP, bold(16.0));
+        let brand = Rect::from_min_size(pos2(r.left() + 20.0, mid - 22.0), Vec2::new(54.0 + name.size().x, 44.0));
+        glass(&p, brand, 22);
+        if let Some(logo) = &self.logo {
+            p.image(logo.id(), Rect::from_center_size(pos2(brand.left() + 25.0, mid), Vec2::splat(24.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
         }
-        // The player sits in the sidebar's bottom corner.
-        ui.add_space((ui.available_height() - 218.0).max(12.0));
-        self.now_playing(ui);
+        p.galley(pos2(brand.left() + 42.0, mid - cap_middle(&name, 16.0)), name, TEXT);
+
+        // The pages, centered.
+        let pages = [(Page::Home, "Home"), (Page::Discover, "Discover"), (Page::Library, "Library")];
+        let names: Vec<_> = pages.iter().map(|(_, n)| label(n, egui::FontId::proportional(14.0))).collect();
+        let width = names.iter().map(|g| g.size().x + 36.0).sum::<f32>() + 8.0;
+        let pill = Rect::from_center_size(pos2(r.center().x, mid), Vec2::new(width, 44.0));
+        glass(&p, pill, 22);
+        let mut x = pill.left() + 4.0;
+        for ((page, _), g) in pages.into_iter().zip(names) {
+            let tab = Rect::from_min_size(pos2(x, pill.top() + 4.0), Vec2::new(g.size().x + 36.0, 36.0));
+            x = tab.right();
+            let resp = ui.interact(tab, ui.id().with(("page", page as u8)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let on = self.page == page;
+            if on || resp.hovered() || resp.has_focus() {
+                p.rect_filled(tab, CornerRadius::same(18), if on { WASH_ON } else { WASH_HOVER });
+            }
+            let color = if on || resp.hovered() { TEXT } else { SOFT };
+            p.galley(pos2(tab.center().x - g.size().x / 2.0, mid - cap_middle(&g, 14.0)), g, color);
+            if resp.clicked() {
+                self.page = page;
+            }
+        }
+
+        // Pause, sound (and its volume while on), settings.
+        let audio = self.cfg.audio;
+        let slider_w = if audio && self.running { 96.0 } else { 0.0 };
+        let corner = Rect::from_min_max(pos2(r.right() - 20.0 - (4.0 + 36.0 * 3.0 + slider_w + 4.0), mid - 22.0), pos2(r.right() - 20.0, mid + 22.0));
+        glass(&p, corner, 22);
+        let spot = |k: f32, extra: f32| Rect::from_min_size(pos2(corner.left() + 4.0 + 36.0 * k + extra, mid - 18.0), Vec2::splat(36.0));
+        if self.running {
+            let paused = self.cfg.paused;
+            // The play triangle reaches 4 px left and 6 right of its point; move it so it looks centered.
+            let tip = if paused { "Play all" } else { "Pause all" };
+            if round_button(ui, spot(0.0, 0.0), "pause", false, |p, c, col| paint_pause(p, c + Vec2::new(if paused { -1.0 } else { 0.0 }, 0.0), paused, col)).on_hover_text(tip).clicked() {
+                self.cfg.paused = !paused;
+                self.commit();
+            }
+            // The speaker reaches 6 px left of its point, its waves 14 right.
+            let tip = if audio { "Sound on · plays from the first screen that's playing" } else { "Sound off" };
+            if round_button(ui, spot(1.0, 0.0), "sound", false, |p, c, col| paint_speaker(p, c - Vec2::new(4.0, 0.0), audio, col)).on_hover_text(tip).clicked() {
+                self.cfg.audio = !audio;
+                self.commit();
+            }
+            if audio {
+                let slot = Rect::from_min_size(pos2(spot(2.0, 0.0).left() + 4.0, mid - 18.0), Vec2::new(slider_w - 8.0, 36.0));
+                let mut volume = self.cfg.volume;
+                let changed = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(slot).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                        ui.spacing_mut().slider_width = slot.width();
+                        ui.add(egui::Slider::new(&mut volume, 0..=100).show_value(false)).on_hover_text(format!("Volume {volume}%")).changed()
+                    })
+                    .inner;
+                if changed {
+                    self.cfg.volume = volume;
+                    // Saved once the slider rests.
+                    self.save_soon(40);
+                }
+            }
+        } else {
+            // Not running: the space says so, with a way to start it.
+            let resp = ui.interact(spot(0.0, 0.0).union(spot(1.0, 0.0)), ui.id().with("start"), Sense::click()).on_hover_text("Wallpapers aren't running").on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.hovered() {
+                p.rect_filled(resp.rect, CornerRadius::same(18), WASH_HOVER);
+            }
+            p.text(resp.rect.center(), egui::Align2::CENTER_CENTER, "Start", bold(13.5), TEXT);
+            if resp.clicked() {
+                spawn_self(&[]);
+            }
+        }
+        let on = self.page == Page::Settings;
+        if round_button(ui, spot(2.0, slider_w), "settings", on, |p, c, col| draw_icon(p, Icon::Gear, Rect::from_center_size(c, Vec2::splat(19.0)), col)).on_hover_text("Settings").clicked() {
+            self.storage = None; // measure again
+            self.page = Page::Settings;
+        }
+    }
+
+    /// The chosen screen's wallpaper, then the recently used ones: what Home's big picture pages through.
+    fn hero_list(&self) -> Vec<String> {
+        let cur = self.cfg.files[self.chosen()].clone();
+        let gone = |p: &String| self.pending_delete.as_ref().is_some_and(|(d, _, _)| d == p);
+        let mut list: Vec<String> = Some(cur.clone()).filter(|c| !c.is_empty()).into_iter().collect();
+        list.extend(self.cfg.recent.iter().filter(|r| **r != cur && !gone(r)).take(5).cloned());
+        list
+    }
+
+    /// The wallpaper shown big on Home: one picked from Recently used, or the chosen screen's.
+    fn hero_path(&self) -> Option<String> {
+        let list = self.hero_list();
+        let gone = |p: &String| self.pending_delete.as_ref().is_some_and(|(d, _, _)| d == p);
+        self.hero.clone().filter(|h| !gone(h) && (list.contains(h) || self.cfg.recent.contains(h))).or_else(|| list.into_iter().next())
+    }
+
+    /// Paints a thumbnail job's picture (see make_thumb) over `rect`, cropped to cover it. False until it's loaded.
+    fn paint_cover(&mut self, ui: &egui::Ui, rect: Rect, job: &str) -> bool {
+        let Some(tex) = self.thumb(job) else { return false };
+        let [tw, th] = tex.size().map(|v| v as f32);
+        ui.painter().image(tex.id(), rect, cover_uv(tw / th.max(1.0), rect.aspect_ratio()), Color32::WHITE);
+        true
+    }
+
+    /// The whole window behind everything: on Home the wallpaper itself, shaded where text sits; elsewhere a soft,
+    /// blurred, darker copy under the glass.
+    fn background(&mut self, ui: &egui::Ui, full: Rect, home: bool) {
+        let path = self.hero_path();
+        let painted = match &path {
+            Some(path) if home => {
+                let job = format!("big:{path}");
+                if self.bg_key != job {
+                    // One big picture at a time: about 6 MB each.
+                    self.thumbs.retain(|k, _| !k.starts_with("big:") || *k == job);
+                    self.bg_key = job.clone();
+                }
+                // The small thumbnail stands in while the big one is made.
+                self.paint_cover(ui, full, &job) || self.paint_cover(ui, full, path)
+            }
+            Some(path) => self.paint_cover(ui, full, &format!("blur:{path}")),
+            None => false,
+        };
+        let p = ui.painter();
+        if !painted {
+            gradient(p, full, BG_TOP, BG_BOTTOM, false);
+        }
+        if home {
+            // Darker on the left and at the bottom, where the title and Recently used sit, and under the top bar.
+            gradient(p, Rect::from_min_max(full.min, pos2(full.left() + full.width() * 0.62, full.bottom())), Color32::from_black_alpha(170), Color32::TRANSPARENT, true);
+            gradient(p, Rect::from_min_max(pos2(full.left(), full.bottom() - full.height() * 0.5), full.max), Color32::TRANSPARENT, Color32::from_black_alpha(215), false);
+            gradient(p, Rect::from_min_max(full.min, pos2(full.right(), full.top() + 120.0)), Color32::from_black_alpha(110), Color32::TRANSPARENT, false);
+        } else if painted {
+            p.rect_filled(full, CornerRadius::ZERO, Color32::from_black_alpha(120));
+        }
     }
 
     /// Once, the first time the window opens: whether Wallpaper Engine is here, and what that means.
@@ -1474,78 +1684,226 @@ impl App {
         }
     }
 
-    fn nav(&mut self, ui: &mut egui::Ui, page: Page, icon: Icon, name: &str, count: usize) {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
-        let on = self.page == page;
-        if on || resp.hovered() || resp.has_focus() {
-            ui.painter().rect_filled(rect, CornerRadius::same(10), if on { RAISED } else { Color32::from_rgb(23, 28, 38) });
-        }
-        let color = if on || resp.hovered() { TEXT } else { GRAY };
-        draw_icon(ui.painter(), icon, Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0)), color);
-        ui.painter().text(pos2(rect.left() + 42.0, rect.center().y), egui::Align2::LEFT_CENTER, name, if on { bold(14.0) } else { egui::FontId::proportional(14.0) }, color);
-        if count > 0 {
-            ui.painter().text(pos2(rect.right() - 12.0, rect.center().y), egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::proportional(12.0), MUTED);
-        }
-        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            if page == Page::Settings {
-                self.storage = None; // measure again
-            }
-            self.page = page;
-        }
-        ui.add_space(2.0);
+    /// Nothing set up and nothing used yet: Home is the welcome.
+    fn nothing_yet(&self) -> bool {
+        self.cfg.files.iter().all(String::is_empty) && self.cfg.waits.iter().all(String::is_empty) && self.cfg.recent.is_empty() && self.adding.is_none()
     }
 
-    fn home(&mut self, ui: &mut egui::Ui) {
-        let nothing = self.cfg.files.iter().all(String::is_empty) && self.cfg.waits.iter().all(String::is_empty) && self.cfg.recent.is_empty() && self.adding.is_none();
-        if nothing {
-            self.welcome(ui);
-            return;
-        }
-        title(ui, "My desktop");
-        sub(
-            ui,
-            if self.screens.len() > 1 {
-                "Click a screen to choose what plays on it. You can also drag a video or GIF onto this window."
-            } else {
-                "This is what plays on your screen. You can also drag a video or GIF onto this window."
-            },
-        );
-        ui.horizontal_top(|ui| {
-            let left_w = (ui.available_width() * 0.46).clamp(300.0, 520.0);
-            ui.allocate_ui_with_layout(Vec2::new(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.set_width(left_w);
-                egui::Frame::new().fill(Color32::from_rgb(15, 19, 27)).corner_radius(CornerRadius::same(14)).inner_margin(14.0).show(ui, |ui| {
-                    self.screens_canvas(ui, left_w - 28.0);
-                });
-            });
-            ui.add_space(12.0);
-            egui::Frame::new().fill(PANEL).corner_radius(CornerRadius::same(14)).inner_margin(16.0).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // The row this sits in is horizontal; the card reads top to bottom.
-                ui.vertical(|ui| self.screen_card(ui));
+    /// Home over the wallpaper: its name and buttons big on the left, the screens (or the options) on the right,
+    /// and Recently used along the bottom.
+    fn home(&mut self, ui: &mut egui::Ui, full: Rect) {
+        let i = self.chosen();
+        let current = self.cfg.files[i].clone();
+        let hero = self.hero_path();
+        let list = self.hero_list();
+
+        // Right: the screens, or the chosen screen's options.
+        let side_w = if self.opts { 372.0 } else { 318.0 };
+        let side = Rect::from_min_max(pos2(full.right() - 24.0 - side_w, full.top() + 84.0), pos2(full.right() - 24.0, full.bottom() - 24.0));
+        let shown = ui.scope_builder(egui::UiBuilder::new().max_rect(side), |ui| {
+            glass_frame().show(ui, |ui| {
+                ui.set_width(side_w - 32.0);
+                if self.opts {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Options · {}", self.where_name(i))).font(bold(15.0)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_button(ui, "Done").clicked() {
+                                self.opts = false;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(side.height() - 80.0).auto_shrink([false, true]).show(ui, |ui| self.options(ui));
+                } else {
+                    self.screens_card(ui, side_w - 32.0);
+                }
             });
         });
-        self.scene_settings(ui);
+        self.side_bottom = shown.response.rect.bottom();
 
-        let recent: Vec<String> = self.cfg.recent.iter().take(RECENT_SHOWN).cloned().collect();
+        // Bottom: Recently used, under the right panel when there's room.
+        let recent: Vec<String> = self.cfg.recent.iter().filter(|r| self.pending_delete.as_ref().is_none_or(|(d, _, _)| d != *r)).take(RECENT_SHOWN).cloned().collect();
+        let strip_h = 160.0;
+        let strip_top = full.bottom() - 20.0 - strip_h;
+        let strip_right = if self.side_bottom + 16.0 < strip_top { full.right() - 24.0 } else { side.left() - 20.0 };
         if !recent.is_empty() {
-            ui.add_space(26.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Recently used").font(bold(16.0)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ghost_button(ui, "See all").clicked() {
-                        self.page = Page::Library;
-                    }
-                });
-            });
-            egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
+            let strip = Rect::from_min_max(pos2(full.left() + 40.0, strip_top), pos2(strip_right, full.bottom() - 20.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 16.0;
-                    for path in recent {
-                        self.tile(ui, &path, Vec2::new(200.0, 112.0));
+                    ui.label(RichText::new("Recently used").font(bold(15.0)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ghost_button(ui, "See all").clicked() {
+                            self.page = Page::Library;
+                        }
+                    });
+                });
+                egui::ScrollArea::horizontal().id_salt("recent").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 14.0;
+                        for path in &recent {
+                            self.recent_tile(ui, path, hero.as_ref() == Some(path));
+                        }
+                    });
+                });
+            });
+        }
+
+        // Left: the big name and what to do with it.
+        let Some(hero) = hero else { return };
+        let bottom = if recent.is_empty() { full.bottom() - 40.0 } else { strip_top - 18.0 };
+        let left = full.left() + 48.0;
+        let area = Rect::from_min_max(pos2(left, bottom - 236.0), pos2((side.left() - 32.0).min(left + 660.0), bottom));
+        let on_it = hero == current;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let eyebrow = if on_it { format!("NOW ON {}", self.where_name(i).to_uppercase()) } else { "RECENTLY USED".to_string() };
+            ui.label(RichText::new(eyebrow).font(bold(12.0)).color(SOFT).extra_letter_spacing(1.2));
+            ui.add(egui::Label::new(RichText::new(file_name(&hero)).font(bold(46.0))).truncate());
+            ui.label(RichText::new(format!("{} · {}", source(&hero), if is_scene(&hero) { "Scene" } else { "Video" })).size(13.5).color(SOFT));
+            if on_it {
+                let (_, long, color) = self.screen_state(i);
+                status_line(ui, long, color, 13.0);
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if on_it {
+                    if primary_button(ui, "Change wallpaper").clicked() {
+                        self.sheet = true;
+                        self.sheet_link = false;
+                    }
+                    if glass_button(ui, "Options").clicked() {
+                        self.opts = !self.opts;
+                    }
+                } else {
+                    if primary_button(ui, &format!("Put on {}", self.where_name(i))).clicked() {
+                        self.use_on(i, hero.clone(), false);
+                        self.hero = None;
+                    }
+                    if !current.is_empty() && glass_button(ui, "Back to current").clicked() {
+                        self.hero = None;
+                    }
+                }
+            });
+            // Dots to page through, with arrows.
+            if list.len() > 1 {
+                ui.add_space(12.0);
+                let at = list.iter().position(|p| *p == hero);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let step = |k: isize| list[(at.map_or(0, |a| a as isize) + k).rem_euclid(list.len() as isize) as usize].clone();
+                    let arrow = |ui: &mut egui::Ui, left: bool| {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                        round_button(ui, rect, if left { "prev" } else { "next" }, false, |p, c, col| {
+                            let d = if left { -1.0 } else { 1.0 };
+                            p.add(egui::Shape::line(vec![c + Vec2::new(-2.5 * d, -5.0), c + Vec2::new(2.5 * d, 0.0), c + Vec2::new(-2.5 * d, 5.0)], Stroke::new(1.8_f32, col)));
+                        })
+                    };
+                    if arrow(ui, true).on_hover_text("Previous").clicked() {
+                        self.hero = Some(step(-1));
+                    }
+                    for (k, p) in list.iter().enumerate() {
+                        let on = at == Some(k);
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(if on { 22.0 } else { 8.0 }, 8.0), Sense::click());
+                        let fill = if on { TEXT } else if resp.hovered() { SOFT } else { Color32::from_white_alpha(90) };
+                        ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+                        if resp.on_hover_text(file_name(p)).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.hero = Some(p.clone());
+                        }
+                    }
+                    if arrow(ui, false).on_hover_text("Next").clicked() {
+                        self.hero = Some(step(1));
+                    }
+                });
+            }
+        });
+    }
+
+    /// A Recently used picture with its name. Click to see it big; right-click for more.
+    fn recent_tile(&mut self, ui: &mut egui::Ui, path: &str, shown: bool) {
+        let size = Vec2::new(180.0, 101.0);
+        ui.allocate_ui(Vec2::new(size.x, size.y + 26.0), |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+                let resp = self.preview(ui, path, size, shown);
+                if resp.clicked() {
+                    self.hero = Some(path.to_string());
+                }
+                let p = path.to_string();
+                resp.context_menu(|ui| self.tile_menu(ui, &p));
+                ui.add(egui::Label::new(RichText::new(file_name(path)).size(13.0)).truncate());
+            });
+        });
+    }
+
+    /// Home's right panel: the screens as Windows arranges them, one picture across all, and how Wisp is doing.
+    fn screens_card(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.label(RichText::new(if self.screens.len() > 1 { "YOUR SCREENS" } else { "YOUR SCREEN" }).font(bold(11.5)).color(GRAY).extra_letter_spacing(1.0));
+        ui.add_space(6.0);
+        self.screens_canvas(ui, width);
+        if self.screens.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("One picture across all").size(13.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if toggle(ui, &mut self.cfg.span).on_hover_text("Stretches Screen 1's wallpaper over the whole desktop").changed() {
+                        if self.cfg.span {
+                            self.selected = 0;
+                        }
+                        self.hero = None;
+                        self.commit();
                     }
                 });
             });
+        }
+        divider(ui);
+        let (text, color) = self.overall();
+        status_line(ui, &text, color, 12.5);
+        if self.running {
+            let pct = |v: Option<f32>| v.map_or("…".to_string(), |v| if v < 10.0 { format!("{v:.1}%") } else { format!("{v:.0}%") });
+            ui.label(small(format!("{} MB memory · CPU {} · GPU {}", self.ram, pct(self.cpu), pct(self.gpu))))
+                .on_hover_text("What Wisp's wallpapers use, as Task Manager counts it");
+        }
+    }
+
+    /// The chosen screen's wallpaper options: how it sits on the screen, the scene's own settings, and removing it.
+    fn options(&mut self, ui: &mut egui::Ui) {
+        let i = self.chosen();
+        let file = self.cfg.files[i].clone();
+        if file.is_empty() {
+            ui.label(small(format!("No wallpaper on {}.", self.where_name(i))));
+            return;
+        }
+        ui.add(egui::Label::new(RichText::new(file_name(&file)).font(bold(14.0))).truncate());
+        ui.add_space(4.0);
+        if self.screen_state(i).0 == "Can't play" {
+            egui::Frame::new().fill(Color32::from_rgb(42, 21, 23)).stroke(Stroke::new(1.0_f32, Color32::from_rgb(77, 38, 41))).corner_radius(CornerRadius::same(10)).inner_margin(10.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let why = if is_scene(&file) {
+                    "This scene uses effects Wisp can't show yet. It's not your PC, and most other scenes work."
+                } else {
+                    "The file may be damaged, or in a format Wisp can't play. It's not your PC."
+                };
+                ui.add(egui::Label::new(RichText::new(why).size(13.0).color(Color32::from_rgb(255, 214, 214))).wrap());
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "Pick another").clicked() {
+                        self.sheet = true;
+                        self.sheet_link = false;
+                    }
+                    if soft_button(ui, "Copy details").on_hover_text("For a bug report").clicked() {
+                        ui.ctx().copy_text(format!("Wisp {} couldn't play: {file}", env!("CARGO_PKG_VERSION")));
+                        self.show_toast("Details copied. Paste them into a bug report.".into(), false);
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+        self.fit_preview(ui, i, &file);
+        self.scene_settings(ui);
+        ui.add_space(12.0);
+        if ghost_button(ui, "Remove from screen").clicked() {
+            self.cfg.files[i].clear();
+            self.cfg.waits[i].clear();
+            self.opts = false;
+            self.commit();
         }
     }
 
@@ -1599,6 +1957,8 @@ impl App {
                 if !self.cfg.span {
                     self.selected = i;
                 }
+                // Home's big picture shows what's on it.
+                self.hero = None;
                 // An empty screen: straight to choosing.
                 if path.is_empty() {
                     self.sheet = true;
@@ -1655,14 +2015,7 @@ impl App {
         let r = Rect::from_min_size(area.min + Vec2::new(l * area.width(), t * area.height()), Vec2::new(w * area.width(), h * area.height()));
         // The thumbnail cropped to the picture's real shape.
         let [tw, th] = tex.size().map(|v| v as f32);
-        let ta = tw / th.max(1.0);
-        let uv = if ta > pic {
-            let keep = pic / ta;
-            Rect::from_min_max(pos2((1.0 - keep) / 2.0, 0.0), pos2((1.0 + keep) / 2.0, 1.0))
-        } else {
-            let keep = ta / pic;
-            Rect::from_min_max(pos2(0.0, (1.0 - keep) / 2.0), pos2(1.0, (1.0 + keep) / 2.0))
-        };
+        let uv = cover_uv(tw / th.max(1.0), pic);
         if let Some(clip) = faint {
             ui.painter_at(clip).image(tex.id(), r, uv, Color32::from_white_alpha(60));
         }
@@ -1768,90 +2121,6 @@ impl App {
         }
     }
 
-    /// The selected screen (or the span): what's on it and everything to change about it.
-    fn screen_card(&mut self, ui: &mut egui::Ui) {
-        let i = self.chosen();
-        let (w, h) = size(&self.screens[i].0);
-        let heading = if self.screens.len() == 1 {
-            format!("YOUR SCREEN · {w} × {h}")
-        } else if self.cfg.span {
-            "ALL SCREENS · ONE PICTURE".to_string()
-        } else {
-            format!("SCREEN {} · {w} × {h}{}", i + 1, if i == 0 { " · MAIN" } else { "" })
-        };
-        ui.label(RichText::new(heading).font(bold(11.5)).color(GRAY));
-        ui.add_space(4.0);
-        let file = self.cfg.files[i].clone();
-        let (_, long, color) = self.screen_state(i);
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                let name = if file.is_empty() { "No wallpaper yet".to_string() } else { file_name(&file) };
-                ui.add(egui::Label::new(RichText::new(name).font(bold(15.0))).truncate());
-                if !file.is_empty() {
-                    ui.label(small(format!("{} · {}", source(&file), if is_scene(&file) { "Scene" } else { "Video" })));
-                }
-                status_line(ui, long, color, 12.5);
-            });
-        });
-        if self.screen_state(i).0 == "Can't play" {
-            ui.add_space(8.0);
-            egui::Frame::new().fill(Color32::from_rgb(42, 21, 23)).stroke(Stroke::new(1.0_f32, Color32::from_rgb(77, 38, 41))).corner_radius(CornerRadius::same(10)).inner_margin(10.0).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let why = if is_scene(&file) {
-                    "This scene uses effects Wisp can't show yet. It's not your PC, and most other scenes work."
-                } else {
-                    "The file may be damaged, or in a format Wisp can't play. It's not your PC."
-                };
-                ui.add(egui::Label::new(RichText::new(why).size(13.0).color(Color32::from_rgb(255, 214, 214))).wrap());
-                ui.horizontal(|ui| {
-                    if primary_button(ui, "Pick another").clicked() {
-                        self.sheet = true;
-                        self.sheet_link = false;
-                    }
-                    if soft_button(ui, "Copy details for a bug report").clicked() {
-                        ui.ctx().copy_text(format!("Wisp {} couldn't play: {file}", env!("CARGO_PKG_VERSION")));
-                        self.show_toast("Details copied. Paste them into a bug report.".into(), false);
-                    }
-                });
-            });
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if primary_button(ui, "Change wallpaper").clicked() {
-                self.sheet = true;
-                self.sheet_link = false;
-            }
-            if !file.is_empty() && ghost_button(ui, "Remove from screen").clicked() {
-                self.cfg.files[i].clear();
-                self.cfg.waits[i].clear();
-                self.commit();
-            }
-        });
-        if !file.is_empty() {
-            divider(ui);
-            self.fit_preview(ui, i, &file);
-        }
-        if self.screens.len() > 1 {
-            divider(ui);
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("One picture across all screens").font(bold(13.0)));
-                    ui.label(small("Stretches Screen 1's wallpaper over the whole desktop."));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if toggle(ui, &mut self.cfg.span).changed() {
-                        if self.cfg.span {
-                            self.selected = 0;
-                        }
-                        self.commit();
-                    }
-                });
-            });
-        }
-    }
-
     /// First time, nothing set up: three plain ways to start.
     fn welcome(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new().fill(Color32::from_rgb(22, 28, 41)).corner_radius(CornerRadius::same(16)).inner_margin(26.0).show(ui, |ui| {
@@ -1921,7 +2190,7 @@ impl App {
             let hidden = shown.len().saturating_sub(FIRST);
             let more_options = self.more_options;
             group(ui, &format!("Options for {}", file_name(&file)), |ui| {
-                ui.spacing_mut().slider_width = 180.0;
+                ui.spacing_mut().slider_width = (ui.available_width() * 0.45).min(180.0);
                 for p in shown.iter().take(if more_options { usize::MAX } else { FIRST }) {
                     let value = now(p);
                     ui.horizontal(|ui| {
@@ -2065,32 +2334,17 @@ impl App {
         }
     }
 
-    /// One search source's tab: its name and what it needs.
+    /// One search source's tab: just its name.
     fn source_tab(&mut self, ui: &mut egui::Ui, k: usize) -> bool {
-        let (badge, color) = match k {
-            0 if self.we_dir.is_some() => ("Steam Workshop", BLUE),
-            0 => ("Needs Wallpaper Engine", AMBER),
-            1 => ("Free · needs Steam", GREEN),
-            _ => ("Free · works now", GREEN),
-        };
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(170.0, 52.0), Sense::click());
         let on = self.source == k;
-        let lit = resp.hovered() || resp.has_focus();
-        let p = ui.painter();
-        p.rect(rect, CornerRadius::same(11), if on { Color32::from_rgb(27, 33, 44) } else { FIELD }, Stroke::new(1.5_f32, if on { TEXT } else if lit { MUTED } else { LINE }), egui::StrokeKind::Inside);
-        p.text(rect.min + Vec2::new(13.0, 15.0), egui::Align2::LEFT_CENTER, SEARCH[k], bold(13.5), TEXT);
-        let galley = p.layout_no_wrap(badge.into(), bold(11.0), color);
-        let b = Rect::from_min_size(rect.min + Vec2::new(12.0, 28.0), galley.size() + Vec2::new(10.0, 4.0));
-        p.rect_filled(b, CornerRadius::same(5), color.gamma_multiply(0.16));
-        p.galley(b.min + Vec2::new(5.0, 2.0), galley, color);
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on
+        chip(ui, SEARCH[k], on).clicked() && !on
     }
 
     /// Search the Workshop and wallpaper sites. A click shows a result big; "Put on …" adds it right away.
     fn discover(&mut self, ui: &mut egui::Ui) {
         let i = self.chosen();
         title(ui, "Discover");
-        sub(ui, "Click a wallpaper to see it bigger and choose where it goes.");
+        sub(ui, "Find something new.");
         // The first visit shows the picked site's popular or newest wallpapers.
         let locked = self.we_dir.is_none() && self.source == 0;
         let mut go = self.hits.is_none() && self.searching.is_none() && !locked;
@@ -2335,7 +2589,7 @@ impl App {
                 }
             });
         });
-        sub(ui, &format!("Every wallpaper on this PC: ones you downloaded, added, or have in Wallpaper Engine. Click one to put it on {}.", self.where_name(i)));
+        sub(ui, "Everything on your PC.");
         let all = self.library_items();
         if all.is_empty() {
             egui::Frame::new().fill(PANEL).corner_radius(CornerRadius::same(14)).inner_margin(28.0).show(ui, |ui| {
@@ -2386,7 +2640,7 @@ impl App {
 
     fn settings(&mut self, ui: &mut egui::Ui) {
         title(ui, "Settings");
-        sub(ui, "Changes apply right away.");
+        sub(ui, "Saved as you go.");
         group(ui, "Picture", |ui| {
             let at = QUALITIES.iter().position(|q| *q == self.cfg.quality).unwrap_or(1);
             let desc = [
@@ -2513,65 +2767,6 @@ impl App {
         });
     }
 
-    /// The sidebar's corner: what Wisp is doing and how much of the PC it uses, then pause and sound for everything.
-    fn now_playing(&mut self, ui: &mut egui::Ui) {
-        let w = ui.available_width();
-        egui::Frame::new().fill(FIELD).corner_radius(CornerRadius::same(12)).inner_margin(12.0).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 6.0;
-            let (text, color) = self.overall();
-            status_line(ui, &text, color, 12.5);
-            if !self.running {
-                if primary_button(ui, "Start Wisp").clicked() {
-                    spawn_self(&[]);
-                }
-                return;
-            }
-            let fmt = |v: Option<f32>, unit: &str| v.map_or("…".to_string(), |v| if unit == "%" && v < 10.0 { format!("{v:.1}%") } else { format!("{v:.0}{unit}") });
-            for (name, value, tip) in [
-                ("Memory", format!("{} MB", self.ram), "Memory Wisp's wallpapers use, as Task Manager counts it"),
-                ("CPU", fmt(self.cpu, "%"), "Share of your whole processor"),
-                ("GPU", fmt(self.gpu, "%"), "Share of your graphics card, as Task Manager counts it"),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(name).size(12.5).color(GRAY));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(value).font(bold(12.5)).color(TEXT));
-                    });
-                })
-                .response
-                .on_hover_text(tip);
-            }
-        });
-        ui.add_space(8.0);
-        // Two equal buttons filling the row, each with its icon and label centered.
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let half = (w - 4.0) / 2.0;
-            let paused = self.cfg.paused;
-            // The pause bars reach 4.75 px each way; the play triangle 4 left, 6 right.
-            let ink = if paused { (4.0, 6.0) } else { (4.75, 4.75) };
-            if icon_button(ui, half, if paused { "Resume all" } else { "Pause all" }, ink, |p, c, col| paint_pause(p, c, paused, col)).clicked() {
-                self.cfg.paused = !paused;
-                self.commit();
-            }
-            let audio = self.cfg.audio;
-            // The speaker's box starts 6 px left; its waves reach 14, the cross 14.5 px right.
-            if icon_button(ui, half, if audio { "Sound on" } else { "Sound off" }, (6.0, 14.5), |p, c, col| paint_speaker(p, c, audio, col)).on_hover_text("Plays from the first screen that's playing").clicked() {
-                self.cfg.audio = !audio;
-                self.commit();
-            }
-        });
-        ui.spacing_mut().slider_width = w;
-        let mut volume = self.cfg.volume;
-        let slider = ui.add_enabled(self.cfg.audio, egui::Slider::new(&mut volume, 0..=100).show_value(false));
-        if slider.on_hover_text(format!("Volume {volume}%")).changed() {
-            self.cfg.volume = volume;
-            // Saved once the slider rests, like scene settings.
-            self.save_soon(40);
-        }
-    }
-
     /// The Change wallpaper sheet: three ways to get one, and the library.
     fn sheet(&mut self, ctx: &egui::Context) {
         if !self.sheet {
@@ -2592,7 +2787,7 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let w = (660.0 - 28.0) / 3.0;
-                if choice(ui, Icon::Search, "Find one online", "Free wallpapers from MoeWalls, MotionBGs and the Steam Workshop.", w).clicked() {
+                if choice(ui, Icon::Search, "Find one online", "From MoeWalls, MotionBGs and Wallpaper Engine.", w).clicked() {
                     self.sheet = false;
                     self.page = Page::Discover;
                 }
@@ -2661,7 +2856,10 @@ impl App {
             });
             ui.add_space(8.0);
             let (rect, _) = ui.allocate_exact_size(Vec2::new(720.0, 405.0), Sense::hover());
-            self.paint_thumb(ui, rect, &hit.thumb, false, false);
+            // The big picture once it's downloaded; the small one until then.
+            let big = format!("big:{}", big_picture(&hit.thumb));
+            let shown = if self.thumb(&big).is_some() { big } else { hit.thumb.clone() };
+            self.paint_thumb(ui, rect, &shown, false, false);
             ui.add_space(10.0);
             let needs = match from {
                 0 => "Wallpaper Engine",
@@ -2726,7 +2924,7 @@ impl App {
         let text = format!("Now on {}: “{}”", self.where_name(screen), file_name(&path));
         let mut keep = false;
         let mut back = false;
-        egui::Area::new(egui::Id::new("trial")).order(egui::Order::Foreground).fade_in(false).anchor(egui::Align2::CENTER_TOP, Vec2::new(112.0, 14.0 - (1.0 - eased) * 70.0)).show(ctx, |ui| {
+        egui::Area::new(egui::Id::new("trial")).order(egui::Order::Foreground).fade_in(false).anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 76.0 - (1.0 - eased) * 70.0)).show(ctx, |ui| {
             ui.multiply_opacity(shown);
             egui::Frame::new()
                 .fill(Color32::from_rgb(35, 42, 55))
@@ -2782,7 +2980,7 @@ impl App {
         }
         let eased = egui::emath::easing::cubic_out(shown);
         let mut undone = false;
-        egui::Area::new(egui::Id::new("toast")).order(egui::Order::Foreground).fade_in(false).anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(112.0, -24.0 + (1.0 - eased) * 24.0)).show(ctx, |ui| {
+        egui::Area::new(egui::Id::new("toast")).order(egui::Order::Foreground).fade_in(false).anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0 + (1.0 - eased) * 24.0)).show(ctx, |ui| {
             ui.multiply_opacity(shown);
             egui::Frame::new().fill(TEXT).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin { left: 16, right: 10, top: 10, bottom: 10 }).show(ui, |ui| {
                 ui.set_max_width(560.0);
@@ -2836,7 +3034,7 @@ impl App {
             p.text(box_.center() - Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, format!("Drop to put it on {target}"), bold(19.0), TEXT);
             p.text(box_.center() + Vec2::new(0.0, 8.0), egui::Align2::CENTER_CENTER, "MP4, WEBM, MKV or GIF", egui::FontId::proportional(13.0), GRAY);
             if self.screens.len() > 1 {
-                p.text(box_.center() + Vec2::new(0.0, 30.0), egui::Align2::CENTER_CENTER, "For another screen, pick it on My desktop first.", egui::FontId::proportional(12.5), MUTED);
+                p.text(box_.center() + Vec2::new(0.0, 30.0), egui::Align2::CENTER_CENTER, "For another screen, pick it on Home first.", egui::FontId::proportional(12.5), MUTED);
             }
         });
     }
@@ -2887,18 +3085,6 @@ impl App {
 }
 
 /// A soft top-to-bottom gradient behind the page.
-fn backdrop(ui: &egui::Ui) {
-    let r = ui.clip_rect();
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(r.left_top(), BG_TOP);
-    mesh.colored_vertex(r.right_top(), BG_TOP);
-    mesh.colored_vertex(r.right_bottom(), BG_BOTTOM);
-    mesh.colored_vertex(r.left_bottom(), BG_BOTTOM);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    ui.painter().add(mesh);
-}
-
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok((path, img)) = self.got_thumb.try_recv() {
@@ -2940,20 +3126,27 @@ impl eframe::App for App {
         self.keys(ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
 
-        egui::SidePanel::left("nav")
-            .exact_width(224.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(egui::Margin::symmetric(12, 0)))
-            .show(ctx, |ui| self.sidebar(ui));
-        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(egui::Margin { left: 30, right: 30, top: 26, bottom: 10 })).show(ctx, |ui| {
-            backdrop(ui);
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.page {
-                Page::Home => self.home(ui),
-                Page::Discover => self.discover(ui),
-                Page::Library => self.library(ui),
-                Page::Settings => self.settings(ui),
-            });
+        // The wallpaper fills the window; everything else is glass on top of it.
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
+            let full = ui.max_rect();
+            let home = self.page == Page::Home && !self.nothing_yet();
+            self.background(ui, full, home);
+            if home {
+                self.home(ui, full);
+            } else {
+                // The other pages (and the welcome) sit in one big glass panel under the top bar.
+                let body = Rect::from_min_max(pos2(full.left() + 24.0, full.top() + 78.0), pos2(full.right() - 24.0, full.bottom() - 24.0));
+                glass(ui.painter(), body, 20);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(body.shrink2(Vec2::new(26.0, 22.0))), |ui| {
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.page {
+                        Page::Home => self.welcome(ui),
+                        Page::Discover => self.discover(ui),
+                        Page::Library => self.library(ui),
+                        Page::Settings => self.settings(ui),
+                    });
+                });
+            }
+            self.top_bar(ui, full);
         });
         self.sheet(ctx);
         self.detail(ctx);
@@ -2979,6 +3172,14 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_big_pictures() {
+        assert_eq!(big_picture("https://images.steamusercontent.com/ugc/1/AB/?ima=fit&impolicy=Letterbox&imw=322&imh=322&letterbox=false"), "https://images.steamusercontent.com/ugc/1/AB/?ima=fit&imw=1280&imh=1280&letterbox=false");
+        assert_eq!(big_picture("https://motionbgs.com/i/c/364x205/media/9963/rain.3840x2160.jpg"), "https://motionbgs.com/i/c/1280x720/media/9963/rain.3840x2160.jpg");
+        assert_eq!(big_picture("https://moewalls.com/wp-content/uploads/2026/11/deepseek-chan-thumb-364x205.jpg"), "https://moewalls.com/wp-content/uploads/2026/11/deepseek-chan-thumb.jpg");
+        assert_eq!(big_picture("https://example.com/a-b.jpg"), "https://example.com/a-b.jpg");
+    }
 
     #[test]
     fn links_made_absolute() {
