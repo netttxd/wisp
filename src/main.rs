@@ -298,11 +298,14 @@ impl Config {
 
     /// Puts a preset on the screens. Screens it doesn't know (one plugged in since) keep what they play.
     fn use_preset(&mut self, p: &Preset) {
-        self.span = p.span;
         for (i, (file, fit, pan, zoom)) in p.screens.iter().enumerate().take(self.files.len()) {
             // A wallpaper deleted since the preset was saved: the screen keeps what it plays.
             if !file.is_empty() && !Path::new(file).exists() {
                 continue;
+            }
+            // "One picture across all" stretches Screen 1's wallpaper, so it follows only when that one does.
+            if i == 0 {
+                self.span = p.span;
             }
             if file.is_empty() {
                 self.files[i].clear();
@@ -1913,6 +1916,37 @@ mod tests {
         assert!(Config::parse(&format!("{}span=true\n", Config::parse("").save_text())).span);
     }
 
+    /// Plays videos with the Anime shaders and reads in mpv's own log which passes ran. A 1080p video filling the
+    /// last screen is enlarged (a portrait screen crops it): the restore, upscale and de-ring passes must run. A 4K
+    /// video on the first screen is only shrunk: every pass must be skipped.
+    /// Needs libmpv-2.dll and the two Workshop videos below: run with --ignored.
+    #[test]
+    #[ignore]
+    fn anime4k_runs_only_while_enlarging() {
+        let mons = monitors();
+        let content = r"C:\Program Files (x86)\Steam\steamapps\workshop\content";
+        let play = |mon: &RECT, video: &str| {
+            let log = env::temp_dir().join("wisp-anime4k-test.log");
+            let _ = fs::remove_file(&log);
+            let win = unsafe { surface(mon) };
+            let (wid, shaders, log_name) = ((win as isize).to_string(), anime4k_shaders(), log.display().to_string());
+            let m = mpv::Mpv::new(&[("wid", &wid), ("panscan", "1.0"), ("aid", "no"), ("glsl-shaders", &shaders), ("log-file", &log_name), ("msg-level", "all=trace")]).unwrap();
+            assert!(m.command(&["loadfile", video]));
+            pump_for(Duration::from_secs(3));
+            stop(&mut Some(Player::new(Engine::Video(m), win, Arc::new(mpv::Audio { on: AtomicBool::new(false), volume: AtomicU32::new(0) }), None)));
+            let text = fs::read_to_string(&log).unwrap();
+            let count = |s: &str| text.matches(s).count();
+            // libplacebo logs "Executing hook pass" for every pass it looks at, then "Skipping" for the ones it drops.
+            (count("Executing hook pass"), count("Skipping hook due to condition"), count("Saving output texture 'PREKERNEL'"), count("Restore-CNN"))
+        };
+        let (seen, skipped, dering, _) = play(&mons.last().unwrap().0, &format!(r"{content}\431960\3278281759\Wallpaper Engine.mp4"));
+        println!("enlarged: {seen} passes seen, {skipped} skipped, de-ring ran {dering} times");
+        assert!(seen > 0 && skipped < seen / 2 && dering > 0);
+        let (seen, skipped, dering, restore) = play(&mons[0].0, &format!(r"{content}\4056970\3818489462\wallpaper.mp4"));
+        println!("shrunk: {seen} passes seen, {skipped} skipped, de-ring ran {dering} times");
+        assert!(restore > 0, "the shaders never loaded");
+        assert_eq!((seen, dering), (skipped, 0));
+    }
     #[test]
     fn mpv_takes_quality_options() {
         // An option this libmpv doesn't know makes every Sharp and Anime wallpaper fail to start.
@@ -1947,15 +1981,18 @@ mod tests {
         // A file deleted since: that screen keeps what it plays (the other screen still follows the preset).
         let mut d = Config::parse("file0=C:\\b.mp4\nfile1=C:\\c.mp4\n");
         d.fit_to(2);
-        d.use_preset(p);
+        let mut p = p.clone();
+        p.span = true;
+        d.use_preset(&p);
         assert_eq!(d.files, ["C:\\b.mp4", ""]);
+        assert!(!d.span, "a deleted wallpaper's preset must not stretch what plays now");
         // A file that exists: putting it back restores it and puts it at the top of the library.
         let real = env::temp_dir().join("wisp-preset-test.mp4");
         fs::write(&real, b"x").unwrap();
         let real = real.display().to_string();
-        let mut p = p.clone();
         p.screens[0].0 = real.clone();
         d.use_preset(&p);
+        assert!(d.span);
         assert_eq!(d.files[0], real);
         assert_eq!((d.fits[0].as_str(), d.zooms[0]), ("fit", 1.5));
         assert_eq!(d.recent[0], real);
